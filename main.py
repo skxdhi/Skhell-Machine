@@ -9,7 +9,9 @@ import buttons
 import cells as cells_module
 import json
 import base64
+import zlib
 
+import pyperclip
 import sympy as sp
 
 eps = sp.Symbol('eps', positive=True, infinitesimal=True)
@@ -185,50 +187,82 @@ celltypes = {
     'anti infinitesimal weight': {'desc': 'A Weight that adds an infinitesimal amount of bias when pushed, an infinitesimal is a number that is bigger than 0 but less that every positive real number'},
 }
 
+cell_to_id = {}
+id_to_cell = {}
+
+for i, name in enumerate(sorted(celltypes.keys())):
+    lower = name.lower()
+    cell_to_id[lower] = i
+    id_to_cell[i] = lower
+
 def make_save_code():
-    global running
-    running = False
-    data = []
+    data = [
+        grid_dimensions[0],
+        grid_dimensions[1],
+        []
+    ]
 
     for i, cell in cells.items():
         if is_border(i):
             continue
 
-        data.append({
-            "x": cell.x,
-            "y": cell.y,
-            "direction": cell.direction,
-            "name": cell.name,
-            "properties": cell.properties
-        })
+        entry = [
+            cell.x,
+            cell.y,
+            cell.direction,
+            cell_to_id[cell.name]
+        ]
 
-    raw = json.dumps(data)
-    code = base64.b64encode(raw.encode()).decode()
-    return code
+        if cell.properties:
+            entry.append(cell.properties)
+
+        data[2].append(entry)
+
+    raw = json.dumps(data, separators=(',', ':')).encode()
+    compressed = zlib.compress(raw, level=9)
+
+    return base64.b64encode(compressed).decode()
 
 def load_save_code(code):
-    global cells, effects, eatencells, next_id, running
-    running = False
+    global cells
+    global effects
+    global eatencells
+    global next_id
+    global grid_dimensions
+    global border_ids
 
-    raw = base64.b64decode(code.encode()).decode()
-    data = json.loads(raw)
+    compressed = base64.b64decode(code.encode())
+    raw = zlib.decompress(compressed).decode()
+
+    width, height, saved_cells = json.loads(raw)
+
+    grid_dimensions = (width, height)
 
     cells = {}
     effects = {}
     eatencells = {}
     next_id = 0
+    border_ids = set()
 
-    grid_borders(grid_dimensions[0], grid_dimensions[1])
-    border_ids.clear()
-    border_ids.update(cells.keys())
+    grid_borders(width, height)
+    border_ids = set(cells.keys())
 
-    for item in data:
+    for entry in saved_cells:
+        x = entry[0]
+        y = entry[1]
+        direction = entry[2]
+        name = id_to_cell[entry[3]]
+
+        properties = {}
+        if len(entry) > 4:
+            properties = entry[4]
+
         add_cell(
-            item["name"],
-            item["x"],
-            item["y"],
-            item["direction"],
-            properties=item.get("properties", {})
+            name,
+            x,
+            y,
+            direction,
+            properties=properties
         )
 
     set_init_state()
@@ -913,6 +947,15 @@ def toggle_mute():
     else:
         pygame.mixer.unpause()
 
+def copy_code():
+    pyperclip.copy(make_save_code())
+
+def paste_code():
+    try:
+        load_save_code(pyperclip.paste())
+    except Exception as e:
+        print("Invalid save code:", e)
+
 def toggle_knights():
     global swap_knights
     swap_knights = not swap_knights
@@ -1180,6 +1223,19 @@ def menu_click(pos):
     if mute_rect.collidepoint(pos):
         toggle_mute()
 
+    copy_rect = pygame.Rect(rect.left + 120, rect.top + 60, 75, 75)
+
+    if copy_rect.collidepoint(pos):
+        copy_code()
+        audio['beep'].play()
+
+    paste_rect = pygame.Rect(rect.left + 210, rect.top + 60, 75, 75)
+
+    if paste_rect.collidepoint(pos):
+        paste_code()
+        audio['beep'].play()
+
+
     toggle_rect = pygame.Rect(rect.left + 30, rect.top + 150, 120, 40)
 
     if toggle_rect.collidepoint(pos):
@@ -1293,6 +1349,24 @@ def draw_menu():
     screen.blit(
         pygame.transform.scale(mute_image, (75, 75)),
         mute_rect.topleft
+    )
+
+    copy_rect = pygame.Rect(rect.left + 120, rect.top + 30, 75, 75)
+
+    copy_image = images['copy']
+
+    screen.blit(
+        pygame.transform.scale(copy_image, (75, 75)),
+        copy_rect.topleft
+    )
+
+    paste_rect = pygame.Rect(rect.left + 210, rect.top + 30, 75, 75)
+
+    paste_image = images['paste']
+
+    screen.blit(
+        pygame.transform.scale(paste_image, (75, 75)),
+        paste_rect.topleft
     )
 
     x_text = font.render("Swap CW and CCW Knight textures", True, (255, 255, 255))
