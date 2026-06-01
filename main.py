@@ -7,6 +7,8 @@ import random
 import anim
 import buttons
 import cells as cells_module
+import json
+import base64
 
 import sympy as sp
 
@@ -182,6 +184,54 @@ celltypes = {
     'infinitesimal weight': {'desc': 'A Weight that takes away an infinitesimal amount of bias when pushed, an infinitesimal is a number that is bigger than 0 but less that every positive real number'},
     'anti infinitesimal weight': {'desc': 'A Weight that adds an infinitesimal amount of bias when pushed, an infinitesimal is a number that is bigger than 0 but less that every positive real number'},
 }
+
+def make_save_code():
+    global running
+    running = False
+    data = []
+
+    for i, cell in cells.items():
+        if is_border(i):
+            continue
+
+        data.append({
+            "x": cell.x,
+            "y": cell.y,
+            "direction": cell.direction,
+            "name": cell.name,
+            "properties": cell.properties
+        })
+
+    raw = json.dumps(data)
+    code = base64.b64encode(raw.encode()).decode()
+    return code
+
+def load_save_code(code):
+    global cells, effects, eatencells, next_id, running
+    running = False
+
+    raw = base64.b64decode(code.encode()).decode()
+    data = json.loads(raw)
+
+    cells = {}
+    effects = {}
+    eatencells = {}
+    next_id = 0
+
+    grid_borders(grid_dimensions[0], grid_dimensions[1])
+    border_ids.clear()
+    border_ids.update(cells.keys())
+
+    for item in data:
+        add_cell(
+            item["name"],
+            item["x"],
+            item["y"],
+            item["direction"],
+            properties=item.get("properties", {})
+        )
+
+    set_init_state()
 
 class Vec2:
     def __init__(self, x: int, y: int):
