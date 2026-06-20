@@ -207,6 +207,11 @@ celltypes = {
     'flipper': {'desc': 'Flips cells horizontally, vertically, or diagonally based on what axis the flipper is facing'},
     'purple mover': {'desc': 'A Mover but when it cant move it gets deleted'},
     'magenta mover': {'desc': 'Deletes cells in front of it only if it cant move it, that doesnt include walls because that would be very broken'},
+    'rotator mover': {'desc': 'A Mover that rotates the cell behind it CCW and the cell in front of it CW, this looks oddly familiar...'},
+    'coin': {'desc': 'When a cell moves into its position, the coin is deleted and that cells coin count is incremented'},
+    'anti coin': {'desc': 'When a cell moves into its position, the coin is deleted and that cells coin count is decremented (the coin count can go negative)'},
+    'adjustable coin': {'desc': 'A coin worth an adjustable amount, it can be positive or negative'},
+    'inertia': {'desc': 'When the cell is pushed, it stores that force and moves with that force every tick, it does this until it hits a wall in which it loses all the momentum'},
 }
 
 cell_to_id = {}
@@ -390,6 +395,9 @@ def mouse_in_rect_obj(rect):
 def is_unbreakable(cell_name, force_name, side, cell):
     return get_tag(cell_name, 'unbreakable', force_name, side, cell)
 
+def is_nonexistant(cell_name, force_name, side, cell):
+    return get_tag(cell_name, 'nonexistant', force_name, side, cell)
+
 
 def get_selected_properties():
     data = get_current_adjustable_data()
@@ -484,6 +492,7 @@ add_tag('unbreakable', {('wall', True),('trash', trash_unbreakable),('ghost', Tr
 add_tag('can_collide', {('enemy', normal_collide),('trash', trash_collide),('friend', normal_collide),('strong enemy', strong_collide),('adjustable enemy', adjustable_enemy_collide),('weak enemy', weak_collide),('stall trash', stall_trash_collide)})
 add_tag('is_friendly', {('friend', True)})
 add_tag('is_unfriendly', {('enemy', True)})
+add_tag('nonexistant', {('coin', True),('anti coin', True),('adjustable coin', True)})
 add_tag('gen_rotate', [
     ('cw generator', [1]),
     ('ccw generator', [-1]),
@@ -562,7 +571,7 @@ cells = {}
 edit_icon = images['edit'] or images['notex']
 
 subcategories = {
-    'movers': ['mover', 'leaper', 'cw knight', 'ccw knight', 'super mover', 'adjustable mover', 'advancer', 'veerer', 'purple mover', 'magenta mover'],
+    'movers': ['mover', 'leaper', 'cw knight', 'ccw knight', 'super mover', 'adjustable mover', 'advancer', 'veerer', 'rotator mover', 'purple mover', 'magenta mover'],
     'pullers': ['puller', 'leap puller', 'super puller', 'advancer'],
     'walls': ['wall', 'ghost'],
     'pushables': ['push', 'slide', '3-way push', '1-way push', 'bent slide', 'random push'],
@@ -585,6 +594,8 @@ subcategories = {
     'redirectors': ['redirector'],
     'players': ['player'],
     'flippers': ['flipper'],
+    'collectables': ['coin', 'anti coin', 'adjustable coin'],
+    'physics': ['inertia'],
 }
 
 categories = [
@@ -631,7 +642,7 @@ categories = [
     {
         'name': 'Miscellaneous',
         'texture': images['disabler'] or images['notex'],
-        'sub': [subcategories['effect givers'], subcategories['storing'], subcategories['players']],
+        'sub': [subcategories['effect givers'], subcategories['storing'], subcategories['players'], subcategories['collectables'], subcategories['physics']],
     },
 ]
 
@@ -721,6 +732,31 @@ def draw_number(cell, properties, alpha=255):
             )
         )
         screen.blit(textt, textt_rect)
+
+    screen.blit(text, text_rect)
+
+def draw_coin_count(cell, properties, alpha=255):
+    x, y = anim.lerp_position(cell.oldx, cell.x, lerp), anim.lerp_position(cell.oldy, cell.y, lerp)
+
+    value = properties['coins']
+
+    outlinecolor = pygame.color.Color(225, 182, 64)
+
+    text = font.render(str(value), True, (255, 255, 255))
+    text = pygame.transform.scale(text, (text.get_width()*zoom/2, text.get_height()*zoom/2))
+    text.set_alpha(alpha)
+
+    screen_x = x * image_size * zoom + camera_pos['x']
+    screen_y = y * image_size * zoom + camera_pos['y']
+
+    cell_size = image_size * zoom
+
+    text_rect = text.get_rect(
+        center=(
+            screen_x + cell_size / 2.7 + (text.get_width()/2),
+            screen_y + cell_size / 1.2
+        )
+    )
 
     screen.blit(text, text_rect)
 
@@ -814,6 +850,14 @@ adjustable(
     {
         'Rotation': [0, 'number+dot'],
         'Random': [False, 'bool'],
+    },
+    draw_number
+)
+
+adjustable(
+    ['adjustable coin'],
+    {
+        'Amount': [0, 'number'],
     },
     draw_number
 )
@@ -947,12 +991,19 @@ def add_cell(cell_name, x, y, direction, oldx=None, oldy=None, olddirection=None
         storing=storing,
     )
 
-    prop = list(cell.properties.copy())
+    prop = cell.properties.copy()
 
-    if cell_name == 'stall trash':
-        prop.append(('wall', set()))
+    if cell.name == 'stall trash':
+        prop['wall'] = set()
 
-    cell.properties = dict(prop)
+    if cell.name == 'inertia':
+        prop['force'] = {
+            'bias': 0,
+            'vector': [0,0],
+        }
+
+    prop['coins'] = 0
+    cell.properties = prop
 
     cells[next_id] = cell
     effects[next_id] = cell.effects
@@ -1769,6 +1820,14 @@ def draw_all_cells():
             anim.lerp_position(cell.oldy, cell.y, lerp),
             anim.lerp_position(cell.olddirection, cell.direction, lerp),
         )
+        if cell.properties['coins'] != 0:
+            draw_cell(
+                'coin icon',
+                anim.lerp_position(cell.oldx, cell.x, lerp),
+                anim.lerp_position(cell.oldy, cell.y, lerp),
+                0,
+            )
+            draw_coin_count(cell, cell.properties, alpha=255)
         draw_func = get_tag_raw(cell.name, 'draw_properties')
 
         if draw_func is not None:
@@ -2169,13 +2228,13 @@ def update():
 
     for i, cell in cell_list:
         if cells[i].name == 'disabler':
-            for k, id in enumerate(get_adjacent_ids(cells[i].x, cells[i].y)):
+            for k, id in get_adjacent_ids(cells[i].x, cells[i].y).items():
                 if id is None: continue
                 give_effect(id, 'disabled', to_side(k, cells[id].direction))
 
     for i, cell in cell_list:
         if cells[i].name == 'enabler':
-            for k, id in enumerate(get_adjacent_ids(cells[i].x, cells[i].y)):
+            for k, id in get_adjacent_ids(cells[i].x, cells[i].y).items():
                 if id is None: continue
                 give_effect(id, 'enabled', to_side(k, cells[id].direction))
 
@@ -2248,6 +2307,15 @@ def update():
         success = False
 
         if cell.name == 'mover':
+            success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
+
+        if cell.name == 'rotator mover':
+            forward = step_forward(cell.x, cell.y, dir_to_vec2(cell.direction))
+            front_id = get_cell_idx_at_pos(forward['x'], forward['y'])
+            backward = step_forward(cell.x, cell.y, dir_to_vec2(cell.direction).negate())
+            back_id = get_cell_idx_at_pos(backward['x'], backward['y'])
+            rotate_cell_id(front_id, 1, cell.direction)
+            rotate_cell_id(back_id, -1, (cell.direction+2)%4)
             success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
 
         if cell.name == 'purple mover':
@@ -2682,6 +2750,12 @@ def update():
 
             pull_cell(id, dir_to_vec2((k + 2) % 4), 1, 999, {'lastcell': id})
 
+    def update_inertia(i, cell):
+        success = push_cell(i, Vec2(cell.properties['force']['vector'][0], cell.properties['force']['vector'][1]), cell.properties['force']['bias'], 999, {'lastcell': i})[0]
+        if not success:
+            cell.properties['force']['vector'] = [0, 0]
+            cell.properties['force']['bias'] = 0
+
     def update_math(i, cell, direction):
         front_data = go_through_wires(cell.x, cell.y, cell.direction)
         top_data = go_through_wires(cell.x, cell.y, cell.direction - 1)
@@ -2717,12 +2791,13 @@ def update():
     run_position_updates(cell_list, subcategories['rotators'], update_rotator)
     run_position_updates(cell_list, subcategories['gears'], update_gear)
     run_position_updates(cell_list, subcategories['redirectors'], update_redirector)
+    run_position_updates(cell_list, ['inertia'], update_inertia)
     run_position_updates(cell_list, ['impulsor'], update_impulsor)
     run_position_updates(cell_list, ['repulsor'], update_repulsor)
     run_directional_updates(cell_list, ['super puller'], update_puller)
     run_directional_updates(cell_list, ['puller', 'diagonal puller', 'leap puller', 'advancer'], update_puller)
     run_directional_updates(cell_list, ['super mover'], update_mover)
-    run_directional_updates(cell_list, ['mover', 'diagonal mover', 'leaper', 'cw knight', 'ccw knight', 'adjustable mover', 'veerer', 'purple mover', 'magenta mover'], update_mover)
+    run_directional_updates(cell_list, ['mover', 'diagonal mover', 'leaper', 'cw knight', 'ccw knight', 'adjustable mover', 'veerer', 'purple mover', 'magenta mover', 'rotator mover'], update_mover)
     run_position_updates(cell_list, subcategories['players'], update_player)
     ticks += 1
 
@@ -2760,9 +2835,21 @@ def push_cell(cell_id, direction, force, depth, data={}):
 
     cell = cells.get(cell_id)
     if cell is None:
-        return True, force #ignore it if it has already moved it
+        return True, force
 
     lastcellid = data.get('lastcell') or cell_id
+
+    if is_nonexistant(cell.name, 'push', to_side(dir_num, cell.direction), cell_id):
+        if cell.name == 'coin':
+            cells[lastcellid].properties['coins'] += 1
+        if cell.name == 'anti coin':
+            cells[lastcellid].properties['coins'] -= 1
+        if cell.name == 'adjustable coin':
+            cells[lastcellid].properties['coins'] += cell.properties['Amount']
+
+        delete_cell(cell.x, cell.y)
+        return True, force
+
     crossed = data.get('crossed') or set()
 
     x, y = cell.x, cell.y
@@ -2796,6 +2883,10 @@ def push_cell(cell_id, direction, force, depth, data={}):
     if cell.name == 'resistance':
         if force != 1:
             return False, 0
+
+    if cell.name == 'inertia':
+        cell.properties['force']['bias'] = force
+        cell.properties['force']['vector'] = [direction.x, direction.y]
 
     if cell.name == 'random push':
         if random.random() < 0.5:
@@ -2869,7 +2960,7 @@ def push_cell(cell_id, direction, force, depth, data={}):
 
     if front_id is not None:
         front = cells[front_id]
-        if front.name == 'mover' or front.name == 'veerer' or front.name == 'purple mover':
+        if front.name == 'mover' or front.name == 'veerer' or front.name == 'purple mover' or front.name == 'rotator mover' or front.name == 'magenta mover':
             mover_vec = dir_to_vec2(front.direction)
 
             if same_vec(mover_vec, direction):
@@ -3017,7 +3108,16 @@ def pull_cell(cell_id, direction, force, depth, data={}, visited=None):
 
     frontid = get_cell_idx_at_pos(newpos[0], newpos[1])
 
-    if lastcellid == cell_id and frontid is not None:
+    if frontid is not None and is_nonexistant(cells[frontid].name, 'pull', to_side(dir_num, cells[frontid].direction), frontid):
+        if cells[frontid].name == 'coin':
+            cells[cell_id].properties['coins'] += 1
+        if cells[frontid].name == 'anti coin':
+            cells[cell_id].properties['coins'] -= 1
+        if cells[frontid].name == 'adjustable coin':
+            cells[cell_id].properties['coins'] += cells[frontid].properties['Amount']
+
+        delete_cell(cells[frontid].x, cells[frontid].y)
+    elif lastcellid == cell_id and frontid is not None:
         if is_unbreakable(cells[frontid].name, 'pull', to_side(dir_num, cells[frontid].direction), frontid):
             return False, 0
         collide_result = get_tag(cells[frontid].name, 'can_collide', frontid, cell_id, to_side(dir_num, cell.direction))
