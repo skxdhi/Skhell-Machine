@@ -1,6 +1,7 @@
 class Cell:
     def __init__(self, x, y, direction, name, oldx=None, oldy=None,
-                 olddirection=None, effects=None, properties=None, updated=False):
+                 olddirection=None, effects=None, properties=None, updated=False, storing=None,
+                 other=None):
         self.x = x
         self.y = y
         self.direction = direction % 4
@@ -13,6 +14,9 @@ class Cell:
         self.effects = effects.copy() if effects is not None else {}
         self.properties = properties.copy() if properties is not None else {}
         self.updated = updated
+        self.storing = storing
+
+        self.other = other if other is not None else {}
 
     def copy(self):
         return Cell(
@@ -26,6 +30,8 @@ class Cell:
             self.effects,
             self.properties,
             self.updated,
+            self.storing,
+            self.other,
         )
 
     def reset(self):

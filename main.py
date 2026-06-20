@@ -9,7 +9,10 @@ import buttons
 import cells as cells_module
 import json
 import base64
+import zlib
+import re
 
+import pyperclip
 import sympy as sp
 
 eps = sp.Symbol('eps', positive=True, infinitesimal=True)
@@ -20,6 +23,12 @@ def resource_path(relative_path):
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+
+def check_nines_anywhere(value):
+    text_value = f"{value:.15f}"
+    pattern = r"^\d+\.\d+9{6}"
+    return bool(re.match(pattern, text_value))
 
 
 pygame.init()
@@ -56,6 +65,7 @@ selected_subcategory = None
 menu_open = False
 music_muted = False
 swap_knights = False
+start_tick_queue = []
 
 typing_number, typing_number_with_dot = False, False
 number_text = ""
@@ -85,6 +95,9 @@ def format_cell_name(name):
             new_words.append(w.capitalize())
 
     return " ".join(new_words)
+
+def add_queue(queue_type, ticks_until_event, event):
+    queue_type.append((ticks_until_event, event))
 
 
 celltypes = {
@@ -183,52 +196,100 @@ celltypes = {
     'veerer': {'desc': 'A Mover but when it cannot move it rotates a certain amount, that amount is adjustable with multiples of 0.5, 0.5 means 45 degree rotation, it can also be negative, there is another switch for random rotation'},
     'infinitesimal weight': {'desc': 'A Weight that takes away an infinitesimal amount of bias when pushed, an infinitesimal is a number that is bigger than 0 but less that every positive real number'},
     'anti infinitesimal weight': {'desc': 'A Weight that adds an infinitesimal amount of bias when pushed, an infinitesimal is a number that is bigger than 0 but less that every positive real number'},
+    'subtract': {'desc': 'Outputs the difference the top input and the bottom input'},
+    'multiply': {'desc': 'Outputs the product of the 2 inputs'},
+    'storage': {'desc': 'When a cell moves into it the cell thats already inside gets moved out (if there is one) and the new one comes in'},
+    'cross diverger': {'desc': 'Like 2 perpendicular Straight Divergers layered on top of eachother'},
+    'ghost': {'desc': 'A Wall combined with an Antigeneratable'},
+    'redirector': {'desc': 'Rotates adjacent cells to face its direction'},
+    'player': {'desc': 'Use arrow keys to make this cell move in that direction'},
+    'stall trash': {'desc': 'Like a trash, but whenever a cell goes into it, it will then act like a wall for one tick on the side/corner the cell went in'},
+    'flipper': {'desc': 'Flips cells horizontally, vertically, or diagonally based on what axis the flipper is facing'},
+    'purple mover': {'desc': 'A Mover but when it cant move it gets deleted'},
+    'magenta mover': {'desc': 'Deletes cells in front of it only if it cant move it, that doesnt include walls because that would be very broken'},
+    'rotator mover': {'desc': 'A Mover that rotates the cell behind it CCW and the cell in front of it CW, this looks oddly familiar...'},
+    'coin': {'desc': 'When a cell moves into its position, the coin is deleted and that cells coin count is incremented'},
+    'anti coin': {'desc': 'When a cell moves into its position, the coin is deleted and that cells coin count is decremented (the coin count can go negative)'},
+    'adjustable coin': {'desc': 'A coin worth an adjustable amount, it can be positive or negative'},
+    'inertia': {'desc': 'When the cell is pushed, it stores that force and moves with that force every tick, it does this until it hits a wall in which it loses all the momentum'},
 }
 
+cell_to_id = {}
+id_to_cell = {}
+
+for i, name in enumerate(sorted(celltypes.keys())):
+    lower = name.lower()
+    cell_to_id[lower] = i
+    id_to_cell[i] = lower
+
 def make_save_code():
-    global running
-    running = False
-    data = []
+    data = [
+        grid_dimensions[0],
+        grid_dimensions[1],
+        []
+    ]
 
     for i, cell in cells.items():
         if is_border(i):
             continue
 
-        data.append({
-            "x": cell.x,
-            "y": cell.y,
-            "direction": cell.direction,
-            "name": cell.name,
-            "properties": cell.properties
-        })
+        entry = [
+            cell.x,
+            cell.y,
+            cell.direction,
+            cell_to_id[cell.name]
+        ]
 
-    raw = json.dumps(data)
-    code = base64.b64encode(raw.encode()).decode()
-    return code
+        if cell.properties:
+            entry.append(cell.properties)
+
+        data[2].append(entry)
+
+    raw = json.dumps(data, separators=(',', ':')).encode()
+    compressed = zlib.compress(raw, level=9)
+
+    return base64.b64encode(compressed).decode()
 
 def load_save_code(code):
-    global cells, effects, eatencells, next_id, running
-    running = False
+    global cells
+    global effects
+    global eatencells
+    global next_id
+    global grid_dimensions
+    global border_ids
 
-    raw = base64.b64decode(code.encode()).decode()
-    data = json.loads(raw)
+    compressed = base64.b64decode(code.encode())
+    raw = zlib.decompress(compressed).decode()
+
+    width, height, saved_cells = json.loads(raw)
+
+    grid_dimensions = (width, height)
 
     cells = {}
     effects = {}
     eatencells = {}
     next_id = 0
+    border_ids = set()
 
-    grid_borders(grid_dimensions[0], grid_dimensions[1])
-    border_ids.clear()
-    border_ids.update(cells.keys())
+    grid_borders(width, height)
+    border_ids = set(cells.keys())
 
-    for item in data:
+    for entry in saved_cells:
+        x = entry[0]
+        y = entry[1]
+        direction = entry[2]
+        name = id_to_cell[entry[3]]
+
+        properties = {}
+        if len(entry) > 4:
+            properties = entry[4]
+
         add_cell(
-            item["name"],
-            item["x"],
-            item["y"],
-            item["direction"],
-            properties=item.get("properties", {})
+            name,
+            x,
+            y,
+            direction,
+            properties=properties
         )
 
     set_init_state()
@@ -331,8 +392,11 @@ def mouse_in_rect_obj(rect):
     return rect.collidepoint(pygame.mouse.get_pos())
 
 
-def is_unbreakable(cell_name, force_name, side):
-    return get_tag(cell_name, 'unbreakable', force_name, side)
+def is_unbreakable(cell_name, force_name, side, cell):
+    return get_tag(cell_name, 'unbreakable', force_name, side, cell)
+
+def is_nonexistant(cell_name, force_name, side, cell):
+    return get_tag(cell_name, 'nonexistant', force_name, side, cell)
 
 
 def get_selected_properties():
@@ -357,11 +421,19 @@ def draw_ghost_properties(cell_name, x, y, direction):
 
     draw_func(fake_cell, get_selected_properties(), alpha=128)
 
+def physical_force(force_name):
+    return force_name in ['push', 'pull', 'grab']
 
-def trash_unbreakable(force_name, side):
-    return force_name != 'rotate'
+def trash_unbreakable(force_name, side, cell_id):
+    return force_name != 'rotate' and not physical_force(force_name)
 
-def weak_collide(cell_id, other_cell_id):
+def stall_trash_unbreakable(force_name, side, cell_id):
+    return trash_unbreakable(force_name, side, cell_id) or side in (cells[cell_id].properties.get('wall') or set())
+
+def redirector_unbreakable(force_name, side, cell_id):
+    return force_name == 'redirect'
+
+def weak_collide(cell_id, other_cell_id, side):
     x = cells[cell_id].x
     y = cells[cell_id].y
 
@@ -369,7 +441,7 @@ def weak_collide(cell_id, other_cell_id):
 
     return True
 
-def normal_collide(cell_id, other_cell_id):
+def normal_collide(cell_id, other_cell_id, side):
     x = cells[cell_id].x
     y = cells[cell_id].y
 
@@ -379,7 +451,7 @@ def normal_collide(cell_id, other_cell_id):
 
     return True
 
-def strong_collide(cell_id, other_cell_id):
+def strong_collide(cell_id, other_cell_id, side):
     x = cells[cell_id].x
     y = cells[cell_id].y
 
@@ -388,7 +460,7 @@ def strong_collide(cell_id, other_cell_id):
 
     return True
 
-def adjustable_enemy_collide(cell_id, other_cell_id):
+def adjustable_enemy_collide(cell_id, other_cell_id, side):
     x = cells[cell_id].x
     y = cells[cell_id].y
 
@@ -400,7 +472,7 @@ def adjustable_enemy_collide(cell_id, other_cell_id):
 
     return True
 
-def trash_collide(cell_id, other_cell_id):
+def trash_collide(cell_id, other_cell_id, side):
     x = cells[cell_id].x
     y = cells[cell_id].y
 
@@ -409,10 +481,18 @@ def trash_collide(cell_id, other_cell_id):
 
     return True
 
-add_tag('unbreakable', {('wall', True),('trash', trash_unbreakable)})
-add_tag('can_collide', {('enemy', normal_collide),('trash', trash_collide),('friend', normal_collide),('strong enemy', strong_collide),('adjustable enemy', adjustable_enemy_collide),('weak enemy', weak_collide)})
+def stall_trash_collide(cell_id, other_cell_id, side):
+    trash_collide(cell_id, other_cell_id, side)
+    cells[cell_id].properties.setdefault('wall', set())
+    add_queue(start_tick_queue, 0, lambda c=cell_id: cells[c].properties['wall'].add(side))
+    add_queue(start_tick_queue, 1, lambda c=cell_id: cells[c].properties['wall'].discard(side))
+    return True
+
+add_tag('unbreakable', {('wall', True),('trash', trash_unbreakable),('ghost', True),('redirector', redirector_unbreakable),('stall trash', stall_trash_unbreakable)})
+add_tag('can_collide', {('enemy', normal_collide),('trash', trash_collide),('friend', normal_collide),('strong enemy', strong_collide),('adjustable enemy', adjustable_enemy_collide),('weak enemy', weak_collide),('stall trash', stall_trash_collide)})
 add_tag('is_friendly', {('friend', True)})
 add_tag('is_unfriendly', {('enemy', True)})
+add_tag('nonexistant', {('coin', True),('anti coin', True),('adjustable coin', True)})
 add_tag('gen_rotate', [
     ('cw generator', [1]),
     ('ccw generator', [-1]),
@@ -439,6 +519,10 @@ add_tag('wiring', [
     ('curve wire', [0,3]),
 ])
 
+add_tag('is_storage', [
+    ('storage', True),
+])
+
 def adjustable_generatable(cell, side):
     count = cell.properties.get('Count', 0)
 
@@ -462,6 +546,7 @@ add_tag('gen_as', [
     ('semigeneratable', semigeneratable),
     ('adjustable generatable', adjustable_generatable),
     ('antigeneratable', 'BLOCK_GENERATOR'),
+    ('ghost', 'BLOCK_GENERATOR')
 ])
 
 def get_wiring(cell_name):
@@ -486,13 +571,13 @@ cells = {}
 edit_icon = images['edit'] or images['notex']
 
 subcategories = {
-    'movers': ['mover', 'leaper', 'cw knight', 'ccw knight', 'super mover', 'adjustable mover', 'advancer', 'veerer'],
+    'movers': ['mover', 'leaper', 'cw knight', 'ccw knight', 'super mover', 'adjustable mover', 'advancer', 'veerer', 'rotator mover', 'purple mover', 'magenta mover'],
     'pullers': ['puller', 'leap puller', 'super puller', 'advancer'],
-    'walls': ['wall'],
+    'walls': ['wall', 'ghost'],
     'pushables': ['push', 'slide', '3-way push', '1-way push', 'bent slide', 'random push'],
     'weights': ['weight', 'anti weight', 'nano weight', 'anti nano weight', 'adjustable weight', 'infinite weight', 'infinitesimal weight', 'anti infinite weight', 'anti infinitesimal weight', 'a weight', 'gold', 'lead', 'conductance', 'restrictor', 'compensator'],
     'rotators': ['cw rotator', 'cw half rotator', 'cw fast rotator', 'ccw rotator', 'ccw half rotator', 'ccw fast rotator', 'random rotator', 'random half rotator', 'random fast rotator', '180 rotator'],
-    'trashes': ['trash'],
+    'trashes': ['trash', 'stall trash'],
     'enemies': ['enemy','strong enemy','adjustable enemy','weak enemy','friend'],
     'generation': ['ungeneratable', 'monogeneratable', 'semigeneratable', 'adjustable generatable', 'antigeneratable'],
     'generators': ['generator','cw generator','cw valve generator','ccw generator','ccw valve generator','bi generator','tri generator','cw skew generator','ccw skew generator','bi skew generator','tri skew generator','physical generator'],
@@ -501,10 +586,16 @@ subcategories = {
     'impulsors': ['impulsor'],
     'gears': ['cw gear', 'ccw gear', '180 gear', 'random gear', 'cw half gear', 'ccw half gear', 'random half gear', 'cw fast gear', 'ccw fast gear', 'random fast gear', 'jam'],
     'mirrors': ['mirror'],
-    'divergers': ['straight diverger','curve diverger'],
+    'divergers': ['straight diverger','curve diverger','cross diverger'],
     'numbers': ['number'],
     'wires': ['straight wire', 'curve wire'],
-    'operations': ['add'],
+    'operations': ['add', 'subtract', 'multiply'],
+    'storing': ['storage'],
+    'redirectors': ['redirector'],
+    'players': ['player'],
+    'flippers': ['flipper'],
+    'collectables': ['coin', 'anti coin', 'adjustable coin'],
+    'physics': ['inertia'],
 }
 
 categories = [
@@ -516,12 +607,12 @@ categories = [
     {
         'name': 'Movers',
         'texture': images['mover'] or images['notex'],
-        'sub': [subcategories['movers'], subcategories['pullers']],
+        'sub': [subcategories['movers'], subcategories['pullers'], subcategories['players']],
     },
     {
         'name': 'Rotators',
         'texture': images['cw rotator'] or images['notex'],  # fix texture name
-        'sub': [subcategories['rotators'], subcategories['gears']],
+        'sub': [subcategories['rotators'], subcategories['flippers'], subcategories['redirectors'], subcategories['gears']],
     },
     {
         'name': 'Destroyers',
@@ -551,7 +642,7 @@ categories = [
     {
         'name': 'Miscellaneous',
         'texture': images['disabler'] or images['notex'],
-        'sub': [subcategories['effect givers']],
+        'sub': [subcategories['effect givers'], subcategories['storing'], subcategories['players'], subcategories['collectables'], subcategories['physics']],
     },
 ]
 
@@ -585,6 +676,27 @@ def draw_sides(cell, properties, alpha=255):
 
 def draw_none(cell, properties, alpha=255):
     pass
+
+def draw_storage(cell, properties, alpha=255):
+    if cell.storing is not None:
+        x = cell.x
+        y = cell.y
+        direction = cell.storing.direction
+        name = cell.storing.name
+
+        size = int(image_size * zoom)
+
+        screen_x = x * image_size * zoom + camera_pos['x']
+        screen_y = y * image_size * zoom + camera_pos['y']
+
+        base_rect = pygame.Rect(screen_x, screen_y, size, size)
+
+        img = pygame.transform.scale(images[name] or images['notex'], (size, size))
+        rotated = pygame.transform.rotate(img, direction)
+        rotated.set_alpha(alpha)
+
+        rotated_rect = rotated.get_rect(center=base_rect.center)
+        screen.blit(rotated, rotated_rect)
 
 def draw_number(cell, properties, alpha=255):
     x, y = cell.x, cell.y
@@ -620,6 +732,31 @@ def draw_number(cell, properties, alpha=255):
             )
         )
         screen.blit(textt, textt_rect)
+
+    screen.blit(text, text_rect)
+
+def draw_coin_count(cell, properties, alpha=255):
+    x, y = anim.lerp_position(cell.oldx, cell.x, lerp), anim.lerp_position(cell.oldy, cell.y, lerp)
+
+    value = properties['coins']
+
+    outlinecolor = pygame.color.Color(225, 182, 64)
+
+    text = font.render(str(value), True, (255, 255, 255))
+    text = pygame.transform.scale(text, (text.get_width()*zoom/2, text.get_height()*zoom/2))
+    text.set_alpha(alpha)
+
+    screen_x = x * image_size * zoom + camera_pos['x']
+    screen_y = y * image_size * zoom + camera_pos['y']
+
+    cell_size = image_size * zoom
+
+    text_rect = text.get_rect(
+        center=(
+            screen_x + cell_size / 2.7 + (text.get_width()/2),
+            screen_y + cell_size / 1.2
+        )
+    )
 
     screen.blit(text, text_rect)
 
@@ -695,7 +832,7 @@ adjustable(
 adjustable(
     ['number'],
     {
-        'Value': [0, 'number'],
+        'Value': [0, 'number+dot'],
     },
     draw_number
 )
@@ -716,6 +853,86 @@ adjustable(
     },
     draw_number
 )
+
+adjustable(
+    ['adjustable coin'],
+    {
+        'Amount': [0, 'number'],
+    },
+    draw_number
+)
+
+flippairs = []
+def get_flip_pairs():
+    global flippairs
+    for name, info in celltypes.items():
+        if 'CW' in name:
+            flippairs.append((name.lower(), name.replace('CW', 'CCW').lower()))
+        if 'CCW' in name:
+            flippairs.append((name.lower(), name.replace('CCW', 'CW').lower()))
+    flippairs = dict(flippairs)
+get_flip_pairs()
+
+v_cells = ['curve diverger', 'curve wire', 'bent slide']
+
+def flip_direction(direction, axis):
+    direction %= 4
+    axis %= 2
+
+    # up/down swap, diagonals mirror vertically
+    if axis == 1:
+        return (-direction) % 4
+
+    # left/right swap, diagonals mirror horizontally
+    if axis == 0:
+        return (2 - direction) % 4
+
+    # diagonal axis 0.5 / 2.5
+    if axis == 1.5:
+        return (1 - direction) % 4
+
+    # diagonal axis 1.5 / 3.5
+    if axis == 0.5:
+        return (3 - direction) % 4
+
+    return direction
+
+def flip_v_direction(direction, axis):
+    direction %= 4
+    axis %= 2
+
+    # horizontal/vertical mirror should only toggle between 2 states
+    if axis == 0:
+        if direction == 0:
+            return 1
+        if direction == 1:
+            return 0
+        if direction == 2:
+            return 3
+        if direction == 3:
+            return 2
+
+    if axis == 1:
+        if direction == 0:
+            return 3
+        if direction == 3:
+            return 0
+        if direction == 1:
+            return 2
+        if direction == 2:
+            return 1
+
+    return direction
+
+def flip_cell(cell, axis):
+    if cell.name in v_cells:
+        cell.direction = flip_v_direction(cell.direction, axis)
+        return
+
+    if cell.name in flippairs:
+        cell.name = flippairs[cell.name]
+
+    cell.direction = flip_direction(cell.direction, axis)
 
 def same_axis(dir1, dir2):
     return dir1 % 2 == dir2 % 2
@@ -754,7 +971,7 @@ def get_cell_idx_at_pos(x, y):
     return None
 
 
-def add_cell(cell_name, x, y, direction, oldx=None, oldy=None, olddirection=None, effectlist=None, properties=None):
+def add_cell(cell_name, x, y, direction, oldx=None, oldy=None, olddirection=None, effectlist=None, properties=None, storing=None, other=None):
     if get_cell_idx_at_pos(x, y) is not None:
         return
 
@@ -771,7 +988,22 @@ def add_cell(cell_name, x, y, direction, oldx=None, oldy=None, olddirection=None
         olddirection=olddirection,
         effects=effectlist,
         properties=properties,
+        storing=storing,
     )
+
+    prop = cell.properties.copy()
+
+    if cell.name == 'stall trash':
+        prop['wall'] = set()
+
+    if cell.name == 'inertia':
+        prop['force'] = {
+            'bias': 0,
+            'vector': [0,0],
+        }
+
+    prop['coins'] = 0
+    cell.properties = prop
 
     cells[next_id] = cell
     effects[next_id] = cell.effects
@@ -781,7 +1013,6 @@ def delete_cell(x, y):
     idx = get_cell_idx_at_pos(x, y)
     if idx is not None and not is_border(idx):
         cells.pop(idx)
-
 
 def fill(pos1, pos2, cell_name):
     x1, y1 = pos1
@@ -808,7 +1039,7 @@ def visual_cell_name(cell_name):
 
 
 def grid_borders(w, h):
-    fill((0, 0), (w, h), 'wall')
+    fill((0, 0), (w, h), 'ghost')
     fill((1, 1), (w - 1, h - 1), None)
 
 
@@ -912,6 +1143,15 @@ def toggle_mute():
         pygame.mixer.pause()
     else:
         pygame.mixer.unpause()
+
+def copy_code():
+    pyperclip.copy(make_save_code())
+
+def paste_code():
+    try:
+        load_save_code(pyperclip.paste())
+    except Exception as e:
+        print("Invalid save code:", e)
 
 def toggle_knights():
     global swap_knights
@@ -1180,6 +1420,19 @@ def menu_click(pos):
     if mute_rect.collidepoint(pos):
         toggle_mute()
 
+    copy_rect = pygame.Rect(rect.left + 120, rect.top + 60, 75, 75)
+
+    if copy_rect.collidepoint(pos):
+        copy_code()
+        audio['beep'].play()
+
+    paste_rect = pygame.Rect(rect.left + 210, rect.top + 60, 75, 75)
+
+    if paste_rect.collidepoint(pos):
+        paste_code()
+        audio['beep'].play()
+
+
     toggle_rect = pygame.Rect(rect.left + 30, rect.top + 150, 120, 40)
 
     if toggle_rect.collidepoint(pos):
@@ -1293,6 +1546,24 @@ def draw_menu():
     screen.blit(
         pygame.transform.scale(mute_image, (75, 75)),
         mute_rect.topleft
+    )
+
+    copy_rect = pygame.Rect(rect.left + 120, rect.top + 30, 75, 75)
+
+    copy_image = images['copy']
+
+    screen.blit(
+        pygame.transform.scale(copy_image, (75, 75)),
+        copy_rect.topleft
+    )
+
+    paste_rect = pygame.Rect(rect.left + 210, rect.top + 30, 75, 75)
+
+    paste_image = images['paste']
+
+    screen.blit(
+        pygame.transform.scale(paste_image, (75, 75)),
+        paste_rect.topleft
     )
 
     x_text = font.render("Swap CW and CCW Knight textures", True, (255, 255, 255))
@@ -1549,6 +1820,14 @@ def draw_all_cells():
             anim.lerp_position(cell.oldy, cell.y, lerp),
             anim.lerp_position(cell.olddirection, cell.direction, lerp),
         )
+        if cell.properties['coins'] != 0:
+            draw_cell(
+                'coin icon',
+                anim.lerp_position(cell.oldx, cell.x, lerp),
+                anim.lerp_position(cell.oldy, cell.y, lerp),
+                0,
+            )
+            draw_coin_count(cell, cell.properties, alpha=255)
         draw_func = get_tag_raw(cell.name, 'draw_properties')
 
         if draw_func is not None:
@@ -1566,6 +1845,8 @@ def draw_all_cells():
                     anim.lerp_position(cell.oldy, cell.y, lerp),
                     0,
                 )
+
+        if cell.storing is not None: draw_storage(cell, cell.properties, 255)
 
 
 def draw_ghost_cell(cell_name, x, y, direction):
@@ -1624,15 +1905,25 @@ def rotate_cell_id(idx, amt, force_dir):
         if blocks_side(cells[idx], force_dir):
             return
 
-        if is_unbreakable(cells[idx].name, 'rotate', to_side(force_dir, cells[idx].direction)):
+        if is_unbreakable(cells[idx].name, 'rotate', to_side(force_dir, cells[idx].direction), idx):
             return
 
         cells[idx].direction = (cells[idx].direction + amt) % 4
 
+def redirect_cell_id(idx, face_dir, force_dir):
+    if idx is not None:
+        if blocks_side(cells[idx], force_dir):
+            return
+
+        if is_unbreakable(cells[idx].name, 'redirect', to_side(force_dir, cells[idx].direction), idx):
+            return
+
+        cells[idx].direction = face_dir
+
 
 def give_effect(id, effect, side):
     if id is not None and effect not in effects[id]:
-        if is_unbreakable(cells[id].name, effect, side):
+        if is_unbreakable(cells[id].name, effect, side, id):
             return
         if effect == 'enabled': take_effect(id, 'disabled', side)
         effects[id][len(effects[id]) + 1] = effect
@@ -1640,7 +1931,7 @@ def give_effect(id, effect, side):
 
 def take_effect(id, effect, side):
     if id is None: return
-    if is_unbreakable(cells[id].name, 'take' + effect, side): return
+    if is_unbreakable(cells[id].name, 'take' + effect, side, id): return
     for key, value in list(effects[id].items()):
         if value == effect:
             effects[id].pop(key)
@@ -1692,6 +1983,10 @@ def step_forward(x, y, direction, loopcount=0, startidx=None):
 
     if cell.name == 'straight diverger':
         if side % 2 == 0:
+            return step_forward(x, y, direction, loopcount, startidx)
+
+    if cell.name == 'cross diverger':
+        if side % 1 == 0:
             return step_forward(x, y, direction, loopcount, startidx)
 
     elif cell.name == 'curve diverger':
@@ -1785,7 +2080,7 @@ def get_math_value(cell_id, reading_dir, visited=None):
     if cell.name == 'number':
         return cell.properties.get('Value', 0)
 
-    if cell.name == 'add':
+    if cell.name in subcategories['operations']:
         if cell.direction != (reading_dir + 2) % 4:
             return 0
 
@@ -1795,6 +2090,16 @@ def get_math_value(cell_id, reading_dir, visited=None):
         top_id = get_cell_idx_at_pos(top_data['x'], top_data['y'])
         bottom_id = get_cell_idx_at_pos(bottom_data['x'], bottom_data['y'])
 
+        if cell.name == 'subtract':
+            return (
+                get_math_value(top_id, cell.direction - 1, visited.copy()) -
+                get_math_value(bottom_id, cell.direction + 1, visited.copy())
+            )
+        if cell.name == 'multiply':
+            return (
+                get_math_value(top_id, cell.direction - 1, visited.copy()) *
+                get_math_value(bottom_id, cell.direction + 1, visited.copy())
+            )
         return (
             get_math_value(top_id, cell.direction - 1, visited.copy()) +
             get_math_value(bottom_id, cell.direction + 1, visited.copy())
@@ -1899,10 +2204,10 @@ def swap_cells(a_pos, b_pos, a_side, b_side):
         return False
 
     # normal unbreakable swap blocking
-    if is_unbreakable(a.name, 'swap', a_side):
+    if is_unbreakable(a.name, 'swap', a_side, a_id):
         return False
 
-    if is_unbreakable(b.name, 'swap', b_side):
+    if is_unbreakable(b.name, 'swap', b_side, b_id):
         return False
 
     a.x, b.x = b.x, a.x
@@ -1911,20 +2216,25 @@ def swap_cells(a_pos, b_pos, a_side, b_side):
     return True
 
 def update():
-    global effects, ticks, initstate, updated
+    global effects, ticks, initstate, updated, start_tick_queue
     updated.clear()
     initstate = False
     cell_list = list(cells.items())
 
+    for ticks, event in start_tick_queue:
+        if ticks <= 0:
+            event()
+    start_tick_queue = [(ticks - 1, event) for ticks, event in start_tick_queue if ticks > 0]
+
     for i, cell in cell_list:
         if cells[i].name == 'disabler':
-            for k, id in enumerate(get_adjacent_ids(cells[i].x, cells[i].y)):
+            for k, id in get_adjacent_ids(cells[i].x, cells[i].y).items():
                 if id is None: continue
                 give_effect(id, 'disabled', to_side(k, cells[id].direction))
 
     for i, cell in cell_list:
         if cells[i].name == 'enabler':
-            for k, id in enumerate(get_adjacent_ids(cells[i].x, cells[i].y)):
+            for k, id in get_adjacent_ids(cells[i].x, cells[i].y).items():
                 if id is None: continue
                 give_effect(id, 'enabled', to_side(k, cells[id].direction))
 
@@ -1999,6 +2309,29 @@ def update():
         if cell.name == 'mover':
             success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
 
+        if cell.name == 'rotator mover':
+            forward = step_forward(cell.x, cell.y, dir_to_vec2(cell.direction))
+            front_id = get_cell_idx_at_pos(forward['x'], forward['y'])
+            backward = step_forward(cell.x, cell.y, dir_to_vec2(cell.direction).negate())
+            back_id = get_cell_idx_at_pos(backward['x'], backward['y'])
+            rotate_cell_id(front_id, 1, cell.direction)
+            rotate_cell_id(back_id, -1, (cell.direction+2)%4)
+            success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
+
+        if cell.name == 'purple mover':
+            success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
+            if not success:
+                cell_delete(i, cell.x, cell.y)
+
+        if cell.name == 'magenta mover':
+            success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
+            if not success:
+                forward = step_forward(cell.x, cell.y, dir_to_vec2(cell.direction))
+                front_id = get_cell_idx_at_pos(forward['x'], forward['y'])
+                if not is_unbreakable(cells[front_id].name, 'push', to_side(cell.direction,cells[front_id].direction), front_id):
+                    cell_delete(front_id, cells[front_id].x, cells[front_id].y)
+                    success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
+
 #        if cell.name == 'cw veerer':
 #            success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
 #            if not success:
@@ -2065,6 +2398,20 @@ def update():
 
                 rotate_cell_id(i, rotation, 0)
 
+    def update_player(i, cell):
+        if cell.name == 'player':
+            keys = pygame.key.get_pressed()
+            direction = Vec2(0,0)
+            if keys[pygame.K_LEFT]:
+                direction = Vec2(-1,0)
+            elif keys[pygame.K_RIGHT]:
+                direction = Vec2(1,0)
+            elif keys[pygame.K_UP]:
+                direction = Vec2(0,-1)
+            elif keys[pygame.K_DOWN]:
+                direction = Vec2(0,1)
+            push_cell(i, direction, 1, 999, {'lastcell': i})
+
     def update_gear(i, cell):
         neighbors = get_adjacent_ids(cell.x, cell.y, surrounding=True)
 
@@ -2116,7 +2463,7 @@ def update():
             if blocks_side(cells[neighbor_id], dir):
                 return
 
-            if is_unbreakable(name, 'swap', to_side(dir, cells[neighbor_id].direction)):
+            if is_unbreakable(name, 'swap', to_side(dir, cells[neighbor_id].direction), i):
                 return
 
             if name in subcategories['gears']:
@@ -2298,6 +2645,22 @@ def update():
                 update_func(i, cell)
                 updated.add(i)
 
+    def update_flipper(i, cell):
+        for k, id in get_adjacent_ids(cell.x, cell.y, 1).items():
+            id = get_adjacent_ids(cell.x, cell.y, 1, surrounding=True)[k]
+            if id is None:
+                continue
+
+            if is_unbreakable(
+                    cells[id].name,
+                    'flip',
+                    to_side(to_side(k, cells[id].direction), cells[id].direction),
+                    id,
+            ):
+                continue
+
+            flip_cell(cells[id], cell.direction)
+
     def update_rotator(i, cell):
         amounts = {
             'cw rotator': 1,
@@ -2341,6 +2704,34 @@ def update():
 
             rotate_cell_id(id, amt, k)
 
+    def update_redirector(i, cell):
+        sides = {
+            0: 'Right',
+            0.5: 'RightDown',
+            1: 'Down',
+            1.5: 'DownLeft',
+            2: 'Left',
+            2.5: 'LeftUp',
+            3: 'Up',
+            3.5: 'UpRight',
+        }
+        for k, id in enumerate(get_adjacent_ids(cell.x, cell.y, 1)):
+            k = (k + cell.direction) % 4
+            id = get_adjacent_ids(cell.x, cell.y, 1, surrounding=True)[k]
+            if id is None:
+                continue
+
+            side_index = (to_side(k, cell.direction) + 2) % 4
+            side_name = sides[side_index]
+
+            side_state = cell.properties.get(side_name, 'None')
+
+            # if side has Push/Wall/etc, rotator does NOT work there
+            if side_state != 'None':
+                continue
+
+            redirect_cell_id(id, cell.direction, k)
+
     def update_repulsor(i, cell):
         for k, id in enumerate(get_adjacent_ids(cell.x, cell.y, 1)):
             k = (k+cell.direction)%4
@@ -2359,6 +2750,12 @@ def update():
 
             pull_cell(id, dir_to_vec2((k + 2) % 4), 1, 999, {'lastcell': id})
 
+    def update_inertia(i, cell):
+        success = push_cell(i, Vec2(cell.properties['force']['vector'][0], cell.properties['force']['vector'][1]), cell.properties['force']['bias'], 999, {'lastcell': i})[0]
+        if not success:
+            cell.properties['force']['vector'] = [0, 0]
+            cell.properties['force']['bias'] = 0
+
     def update_math(i, cell, direction):
         front_data = go_through_wires(cell.x, cell.y, cell.direction)
         top_data = go_through_wires(cell.x, cell.y, cell.direction - 1)
@@ -2375,24 +2772,33 @@ def update():
 
         if cell.name == 'add':
             answer = topval + botval
+        elif cell.name == 'subtract':
+            answer = topval - botval
+        elif cell.name == 'multiply':
+            answer = topval * botval
         else:
             return
-        
-        front.properties['Value'] = answer
+
+        if frontid is not None:
+            front.properties['Value'] = answer
 
 
-    run_directional_updates(cell_list, ['add'], update_math, reverse=True)
+    run_directional_updates(cell_list, subcategories['operations'], update_math, reverse=True)
     run_directional_updates(cell_list, ['mirror'], update_mirror, 'h')
     run_directional_updates(cell_list, ['mirror'], update_mirror, 'v')
     run_directional_updates(cell_list, subcategories['generators'], update_generator)
+    run_position_updates(cell_list, subcategories['flippers'], update_flipper)
     run_position_updates(cell_list, subcategories['rotators'], update_rotator)
     run_position_updates(cell_list, subcategories['gears'], update_gear)
+    run_position_updates(cell_list, subcategories['redirectors'], update_redirector)
+    run_position_updates(cell_list, ['inertia'], update_inertia)
     run_position_updates(cell_list, ['impulsor'], update_impulsor)
     run_position_updates(cell_list, ['repulsor'], update_repulsor)
     run_directional_updates(cell_list, ['super puller'], update_puller)
     run_directional_updates(cell_list, ['puller', 'diagonal puller', 'leap puller', 'advancer'], update_puller)
     run_directional_updates(cell_list, ['super mover'], update_mover)
-    run_directional_updates(cell_list, ['mover', 'diagonal mover', 'leaper', 'cw knight', 'ccw knight', 'adjustable mover', 'veerer'], update_mover)
+    run_directional_updates(cell_list, ['mover', 'diagonal mover', 'leaper', 'cw knight', 'ccw knight', 'adjustable mover', 'veerer', 'purple mover', 'magenta mover', 'rotator mover'], update_mover)
+    run_position_updates(cell_list, subcategories['players'], update_player)
     ticks += 1
 
 
@@ -2431,39 +2837,56 @@ def push_cell(cell_id, direction, force, depth, data={}):
     if cell is None:
         return True, force
 
-    lastcellid = get_cell_idx_at_pos(cells[data['lastcell']].x, cells[data['lastcell']].y)
+    lastcellid = data.get('lastcell') or cell_id
+
+    if is_nonexistant(cell.name, 'push', to_side(dir_num, cell.direction), cell_id):
+        if cell.name == 'coin':
+            cells[lastcellid].properties['coins'] += 1
+        if cell.name == 'anti coin':
+            cells[lastcellid].properties['coins'] -= 1
+        if cell.name == 'adjustable coin':
+            cells[lastcellid].properties['coins'] += cell.properties['Amount']
+
+        delete_cell(cell.x, cell.y)
+        return True, force
+
+    crossed = data.get('crossed') or set()
 
     x, y = cell.x, cell.y
     forward = step_forward(x, y, direction)
     newpos = (forward['x'], forward['y'])
 
-    if newpos == (cell.x, cell.y):
-        cell.direction = vec_to_dir(forward['direction'])
-        direction = forward['direction']
-        newpos = get_pos_infront_of_pos((cell.x, cell.y), cell.direction)
+    if cell_id in crossed:
+        return True, force
+
+    crossed.add(cell_id)
 
     new_direction = None
 
     if forward.get('rotated', False):
         direction = forward['direction']
-        new_direction = vec_to_dir(forward['direction'])
+        new_direction = vec_to_dir(direction)
 
     front_id = get_cell_idx_at_pos(newpos[0], newpos[1])
 
     if blocks_side(cell, dir_num):
         return False, 0
 
-    collide_result = get_tag(cell.name, 'can_collide', cell_id, lastcellid)
+    if is_unbreakable(cell.name, 'push', to_side(dir_num, cell.direction), cell_id):
+        return False, 0
+
+    collide_result = get_tag(cell.name, 'can_collide', cell_id, lastcellid, to_side(dir_num, cell.direction))
 
     if collide_result is not None:
         return collide_result, force
 
-    if is_unbreakable(cell.name, 'push', to_side(dir_num, cell.direction)):
-        return False, 0
-
     if cell.name == 'resistance':
         if force != 1:
             return False, 0
+
+    if cell.name == 'inertia':
+        cell.properties['force']['bias'] = force
+        cell.properties['force']['vector'] = [direction.x, direction.y]
 
     if cell.name == 'random push':
         if random.random() < 0.5:
@@ -2532,12 +2955,12 @@ def push_cell(cell_id, direction, force, depth, data={}):
             force = 0
 
     if cell.name == 'bent slide':
-        if cell.direction == (dir_num + 1) % 4 or cell.direction == dir_num:
+        if cell.direction == (dir_num - 1) % 4 or cell.direction == dir_num:
             force = 0
 
     if front_id is not None:
         front = cells[front_id]
-        if front.name == 'mover' or front.name == 'cw veerer' or front.name == 'ccw veerer':
+        if front.name == 'mover' or front.name == 'veerer' or front.name == 'purple mover' or front.name == 'rotator mover' or front.name == 'magenta mover':
             mover_vec = dir_to_vec2(front.direction)
 
             if same_vec(mover_vec, direction):
@@ -2610,7 +3033,7 @@ def push_cell(cell_id, direction, force, depth, data={}):
             if opposite_vec(mover_vec, direction):
                 force -= 1
 
-        success, force = push_cell(front_id, direction, force, depth - 1, {'lastcell': cell_id})
+        success, force = push_cell(front_id, direction, force, depth - 1, {'lastcell': cell_id, 'crossed': crossed})
 
         if not success:
             return False, force
@@ -2641,10 +3064,10 @@ def pull_cell(cell_id, direction, force, depth, data={}, visited=None):
     if visited is None:
         visited = set()
 
-    state = (cell_id, direction.x, direction.y)
+    state = cell_id
 
     if state in visited:
-        return True, force
+        return True, force #ignore if it has already been pulled
 
     visited.add(state)
 
@@ -2664,32 +3087,40 @@ def pull_cell(cell_id, direction, force, depth, data={}, visited=None):
     if cell is None:
         return True, force
 
-    if is_unbreakable(cells[cell_id].name, 'pull', to_side(dir_num, cells[cell_id].direction)):
+    if is_unbreakable(cells[cell_id].name, 'pull', to_side(dir_num, cells[cell_id].direction), cell_id):
         return False, 0
 
     if blocks_side(cell, dir_num):
         return False, 0
 
-    lastcellid = get_cell_idx_at_pos(cells[data['lastcell']].x, cells[data['lastcell']].y)
+    lastcellid = data.get('lastcell') or cell_id
 
     x, y = cell.x, cell.y
     forward = step_forward(x, y, direction)
     newpos = (forward['x'], forward['y'])
 
+    old_direction = direction
     new_direction = None
 
     if forward.get('rotated', False):
-        new_direction = vec_to_dir(forward['direction'])
-
-    if newpos == (cell.x, cell.y):
-        cell.direction = vec_to_dir(forward['direction'])
         direction = forward['direction']
-        newpos = get_pos_infront_of_pos((cell.x, cell.y), cell.direction)
+        new_direction = vec_to_dir(forward['direction'])
 
     frontid = get_cell_idx_at_pos(newpos[0], newpos[1])
 
-    if lastcellid == cell_id and frontid is not None:
-        collide_result = get_tag(cells[frontid].name, 'can_collide', frontid, cell_id)
+    if frontid is not None and is_nonexistant(cells[frontid].name, 'pull', to_side(dir_num, cells[frontid].direction), frontid):
+        if cells[frontid].name == 'coin':
+            cells[cell_id].properties['coins'] += 1
+        if cells[frontid].name == 'anti coin':
+            cells[cell_id].properties['coins'] -= 1
+        if cells[frontid].name == 'adjustable coin':
+            cells[cell_id].properties['coins'] += cells[frontid].properties['Amount']
+
+        delete_cell(cells[frontid].x, cells[frontid].y)
+    elif lastcellid == cell_id and frontid is not None:
+        if is_unbreakable(cells[frontid].name, 'pull', to_side(dir_num, cells[frontid].direction), frontid):
+            return False, 0
+        collide_result = get_tag(cells[frontid].name, 'can_collide', frontid, cell_id, to_side(dir_num, cell.direction))
 
         if collide_result is not None:
             pull_behind(x, y, direction, force, depth, cell_id)
@@ -2748,14 +3179,16 @@ def pull_cell(cell_id, direction, force, depth, data={}, visited=None):
         if cell.direction != (dir_num + 2) % 4:
             force = 0
     if cell.name == 'bent slide':
-        if cell.direction == (dir_num + 1) % 4 or cell.direction == dir_num:
+        if cell.direction == (dir_num - 1) % 4 or cell.direction == dir_num:
             force = 0
 
     backward = step_forward(x, y, direction.multiply(-1))
     behindpos = (backward['x'], backward['y'])
+    print("BACKWARD", backward)
+    print("BEHINDPOS", behindpos)
     behind_id = get_cell_idx_at_pos(behindpos[0], behindpos[1])
-
-    print(behindpos, (cell.x, cell.y))
+    print("CELL", cell.name, cell.x, cell.y)
+    print("BEHIND ID", behind_id)
 
     if behind_id is not None:
         behind = cells[behind_id]
@@ -2805,7 +3238,24 @@ def pull_cell(cell_id, direction, force, depth, data={}, visited=None):
             if opposite_vec(mover_vec, direction):
                 force -= 1
 
-        if not pull_cell(behind_id, direction, force, depth - 1, {'lastcell': cell_id}, visited)[0]:
+        next_pull_direction = direction
+
+        if backward.get('rotated', False):
+            next_pull_direction = backward['direction'].multiply(-1)
+
+        print("PULLING", behind_id)
+        result = pull_cell(
+            behind_id,
+            direction,
+            force,
+            depth - 1,
+            {'lastcell': cell_id},
+            visited
+        )
+
+        print("RESULT", result)
+
+        if not result[0]:
             return False, force
 
     if force <= 0:
@@ -2815,9 +3265,12 @@ def pull_cell(cell_id, direction, force, depth, data={}, visited=None):
         return True, force
 
     if new_direction is not None:
-        cells[cell_id].direction += new_direction-vec_to_dir(direction)
-        cells[cell_id].direction = cells[cell_id].direction % 4
-
+        cells[cell_id].direction += (
+                vec_to_dir(direction)
+                - vec_to_dir(old_direction)
+        )
+        cells[cell_id].direction %= 4
+    print(cell.name, cell.x, cell.y, "->", newpos)
     move_or_delete(cell_id, newpos)
     return True, force
 
@@ -2835,6 +3288,10 @@ while x:
         lerp = 0
     mouse_x, mouse_y = pygame.mouse.get_pos()
     mouse_buttons = pygame.mouse.get_pressed()
+    if not mouse_buttons[0]:
+        for cell in cells.values():
+            if get_tag(cell.name, 'is_storage'):
+                cell.properties['RequireMouseRelease'] = False
     place_x = round(((mouse_x - camera_pos['x']) / (image_size * zoom)) - 0.5)
     place_y = round(((mouse_y - camera_pos['y']) / (image_size * zoom)) - 0.5)
     clicking_button = False
@@ -2932,18 +3389,44 @@ while x:
                     properties=get_selected_properties()
                 )
             else:
-                delete_cell(place_x, place_y)
-                add_cell(
-                    selected.get('cell_name'),
-                    place_x,
-                    place_y,
-                    selected.get('direction'),
-                    properties=get_selected_properties()
-                )
+                name = cells[get_cell_idx_at_pos(place_x, place_y)].name
+                if get_tag(name, 'is_storage'):
+                    storage = cells[get_cell_idx_at_pos(place_x, place_y)]
+
+                    storage.storing = cells_module.Cell(
+                        name=selected.get('cell_name'),
+                        x=place_x,
+                        y=place_y,
+                        direction=selected.get('direction'),
+                        properties=get_selected_properties()
+                    )
+                    storage.properties['RequireMouseRelease'] = True
+                else:
+                    delete_cell(place_x, place_y)
+                    add_cell(
+                        selected.get('cell_name'),
+                        place_x,
+                        place_y,
+                        selected.get('direction'),
+                        properties=get_selected_properties()
+                    )
     if mouse_buttons[2]:
         idx = get_cell_idx_at_pos(place_x, place_y)
         if idx is not None and not is_border(idx):
-            delete_cell(place_x, place_y)
+            cell = cells[idx]
+            if get_tag(cell.name, 'is_storage'):
+                if cell.storing is not None:
+                    cell.storing = None
+                    cell.properties['RequireMouseRelease'] = True
+                elif not cell.properties.get('RequireMouseRelease', False):
+                    delete_cell(place_x, place_y)
+            else:
+                delete_cell(place_x, place_y)
+    if mouse_buttons[1]:
+        idx = get_cell_idx_at_pos(place_x, place_y)
+        if idx is not None:
+            cell = cells[idx]
+            selectidx = list(celltypes.keys()).index(format_cell_name(cell.name))
     keys = pygame.key.get_pressed()
     camera_speed = 10
     if keys[pygame.K_w]:
