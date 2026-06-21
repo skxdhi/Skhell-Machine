@@ -212,6 +212,7 @@ celltypes = {
     'anti coin': {'desc': 'When a cell moves into its position, the coin is deleted and that cells coin count is decremented (the coin count can go negative)'},
     'adjustable coin': {'desc': 'A coin worth an adjustable amount, it can be positive or negative'},
     'inertia': {'desc': 'When the cell is pushed, it stores that force and moves with that force every tick, it does this until it hits a wall in which it loses all the momentum'},
+    'hydra': {'desc': 'When it hits a wall it turns perpendicularly, but there are two ways to go perpendicular, so it can choose both paths, if it cant choose any then it dissapears'},
 }
 
 cell_to_id = {}
@@ -571,7 +572,7 @@ cells = {}
 edit_icon = images['edit'] or images['notex']
 
 subcategories = {
-    'movers': ['mover', 'leaper', 'cw knight', 'ccw knight', 'super mover', 'adjustable mover', 'advancer', 'veerer', 'rotator mover', 'purple mover', 'magenta mover'],
+    'movers': ['mover', 'leaper', 'cw knight', 'ccw knight', 'super mover', 'adjustable mover', 'advancer', 'veerer', 'rotator mover', 'purple mover', 'magenta mover', 'hydra'],
     'pullers': ['puller', 'leap puller', 'super puller', 'advancer'],
     'walls': ['wall', 'ghost'],
     'pushables': ['push', 'slide', '3-way push', '1-way push', 'bent slide', 'random push'],
@@ -1008,8 +1009,16 @@ def add_cell(cell_name, x, y, direction, oldx=None, oldy=None, olddirection=None
     cells[next_id] = cell
     effects[next_id] = cell.effects
 
+def copy_cell(id):
+    global next_id
+    next_id += 1
+    cells[next_id] = cell.copy()
+    return next_id
 
-def delete_cell(x, y):
+def delete_cell(x, y=None):
+    if y is None:
+        cells.pop(x)
+        return
     idx = get_cell_idx_at_pos(x, y)
     if idx is not None and not is_border(idx):
         cells.pop(idx)
@@ -2309,6 +2318,52 @@ def update():
         if cell.name == 'mover':
             success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
 
+        if cell.name == 'hydra':
+            success = push_cell(i, dir_to_vec2(cell.direction), 1, 999, {'lastcell': i})[0]
+
+            if not success:
+                old_x = cell.x
+                old_y = cell.y
+                old_direction = cell.direction
+
+                cw = cell.copy()
+                ccw = cell.copy()
+
+                delete_cell(i)
+
+                global next_id
+
+                next_id += 1
+                cwid = next_id
+                cells[cwid] = cw
+                effects[cwid] = cw.effects
+
+                next_id += 1
+                ccwid = next_id
+                cells[ccwid] = ccw
+                effects[ccwid] = ccw.effects
+
+                cw.x = old_x
+                cw.y = old_y
+                cw.oldx = old_x
+                cw.oldy = old_y
+                cw.direction = (old_direction + 1) % 4
+                cw.olddirection = old_direction
+
+                ccw.x = old_x
+                ccw.y = old_y
+                ccw.oldx = old_x
+                ccw.oldy = old_y
+                ccw.direction = (old_direction - 1) % 4
+                ccw.olddirection = old_direction
+
+                if not push_cell(cwid, dir_to_vec2(cw.direction), 1, 999, {'lastcell': cwid})[0]:
+                    delete_cell(cwid)
+
+                if not push_cell(ccwid, dir_to_vec2(ccw.direction), 1, 999, {'lastcell': ccwid})[0]:
+                    delete_cell(ccwid)
+
+
         if cell.name == 'rotator mover':
             forward = step_forward(cell.x, cell.y, dir_to_vec2(cell.direction))
             front_id = get_cell_idx_at_pos(forward['x'], forward['y'])
@@ -2797,7 +2852,7 @@ def update():
     run_directional_updates(cell_list, ['super puller'], update_puller)
     run_directional_updates(cell_list, ['puller', 'diagonal puller', 'leap puller', 'advancer'], update_puller)
     run_directional_updates(cell_list, ['super mover'], update_mover)
-    run_directional_updates(cell_list, ['mover', 'diagonal mover', 'leaper', 'cw knight', 'ccw knight', 'adjustable mover', 'veerer', 'purple mover', 'magenta mover', 'rotator mover'], update_mover)
+    run_directional_updates(cell_list, ['mover', 'diagonal mover', 'leaper', 'cw knight', 'ccw knight', 'adjustable mover', 'veerer', 'purple mover', 'magenta mover', 'rotator mover', 'hydra'], update_mover)
     run_position_updates(cell_list, subcategories['players'], update_player)
     ticks += 1
 
@@ -2960,7 +3015,7 @@ def push_cell(cell_id, direction, force, depth, data={}):
 
     if front_id is not None:
         front = cells[front_id]
-        if front.name == 'mover' or front.name == 'veerer' or front.name == 'purple mover' or front.name == 'rotator mover' or front.name == 'magenta mover':
+        if front.name == 'mover' or front.name == 'hydra' or front.name == 'veerer' or front.name == 'purple mover' or front.name == 'rotator mover' or front.name == 'magenta mover':
             mover_vec = dir_to_vec2(front.direction)
 
             if same_vec(mover_vec, direction):
