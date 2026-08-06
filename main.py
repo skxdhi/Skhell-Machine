@@ -1,3 +1,17 @@
+"""
+Skhell Machine — cellular automaton sandbox.
+
+Architecture (incremental cleanup from a pre-OOP codebase):
+  cells.py       – Cell data object
+  buttons.py     – UI button widget + easing
+  anim.py        – simple lerp helper
+  registry.py    – cell type descriptions, tags, categories (extracted)
+  game_state.py  – GameState owning grid/cells/effects (extracted; migrate call sites over time)
+  main.py        – simulation, rendering, input, main loop
+
+Simulation state is still mostly module-level globals for compatibility; new code
+should prefer GameState methods (register_cell, add_cell, move_cell_to, …).
+"""
 import math
 
 import pygame
@@ -78,6 +92,7 @@ number_text = ""
 
 initstate = True
 initcells = {}
+initticks = 0
 
 updated = set()
 
@@ -511,6 +526,15 @@ def is_unbreakable(cell_name, force_name, side, cell):
 def is_nonexistant(cell_name, force_name, side, cell):
     return get_tag(cell_name, 'nonexistant', force_name, side, cell)
 
+def get_default_properties(cell_name):
+    """Defaults from adjustable() for this cell type, or {} if none."""
+    data = get_adjustable(cell_name)
+    if data is None:
+        return {}
+    return {
+        key: value[0]
+        for key, value in data.items()
+    }
 
 def get_selected_properties():
     data = get_current_adjustable_data()
@@ -907,7 +931,7 @@ def enter_storage(storage_id, entering_id, direction, force, depth, data=None):
     storage = cells[storage_id]
     entering = cells[entering_id]
 
-    old_stored = storage.properties.get('stored')
+    old_stored = get_stored_data(storage_id)
 
     if old_stored is not None:
         # The Storage still occupies this coordinate. The ejected cell is
@@ -1623,6 +1647,10 @@ def add_cell(cell_name, x, y, direction, oldx=None, oldy=None, olddirection=None
     )
 
     prop = cell.properties.copy()
+
+    for key, default in get_default_properties(cell_name).items():
+        prop.setdefault(key, default)
+
     prop['tickamount'] = 1
 
     if cell.name == 'stall trash':
@@ -2094,7 +2122,7 @@ def snapshot_cells(source):
 
 
 def revert():
-    global cells, grid, effects, initstate, running, lerp, eatencells, start_tick_queue
+    global cells, grid, effects, initstate, running, lerp, eatencells, start_tick_queue, initticks, ticks
 
     running = False
     lerp = 0
@@ -2111,11 +2139,13 @@ def revert():
     rebuild_grid()
 
     initstate = True
+    ticks = initticks
 
 
 def set_init_state():
-    global initstate, initcells
+    global initstate, initcells, initticks, ticks
     initcells = snapshot_cells(cells)
+    initticks = ticks
     initstate = True
 
 
@@ -3030,7 +3060,7 @@ def step_forward(x, y, direction, loopcount=0, startidx=None):
             return step_forward(x, y, direction, loopcount, startidx)
 
     if cell.name == 'slope':
-        result = step_forward(x, y, direction.rotate([1, -1][(side+1)%2]), loopcount, startidx)
+        result = step_forward(x, y, direction.rotate({0: 1, 0.5: 0, 1: -1, 1.5: 0}[(side+1)%2]), loopcount, startidx)
         result['rotated'] = False
         return result
 
@@ -3118,12 +3148,12 @@ def piping_step_forward(x, y, direction, passed=None):
 
 
 def go_through_wires(x, y, direction, visited=None):
+    """Step once in direction, then follow wires until a non-wire (or empty)."""
     if visited is None:
         visited = set()
 
     dir_num = direction % 4
     move_vec = dir_to_vec2(dir_num)
-
     x += move_vec.x
     y += move_vec.y
 
@@ -3133,31 +3163,28 @@ def go_through_wires(x, y, direction, visited=None):
         if idx is None:
             return {'x': x, 'y': y, 'direction': dir_num}
 
+        cell = cells[idx]
+        wiring = get_wiring(cell.name)
+
+        # Non-wire endpoint — do NOT add to visited (Numbers must stay readable)
+        if wiring is None:
+            return {'x': x, 'y': y, 'direction': dir_num}
+
         if idx in visited:
             return {'x': x, 'y': y, 'direction': dir_num}
 
         visited.add(idx)
 
-        cell = cells[idx]
-        wiring = get_wiring(cell.name)
-
-        if wiring is None:
-            return {'x': x, 'y': y, 'direction': dir_num}
-
         enter_side = to_side(dir_num, cell.direction)
-
         if enter_side not in wiring:
             return {'x': x, 'y': y, 'direction': dir_num}
 
-        exits = wiring.copy()
-        exits.remove(enter_side)
-
-        if len(exits) == 0:
+        exits = [s for s in wiring if s != enter_side]
+        if not exits:
             return {'x': x, 'y': y, 'direction': dir_num}
 
         exit_side = exits[0]
         dir_num = (exit_side + cell.direction) % 4
-
         move_vec = dir_to_vec2(dir_num)
         x += move_vec.x
         y += move_vec.y
@@ -3176,50 +3203,53 @@ def get_math_value(cell_id, reading_dir, visited=None):
     visited.add(cell_id)
 
     cell = cells[cell_id]
+    reading_dir = reading_dir % 4
 
     wiring = get_wiring(cell.name)
 
     if wiring is not None:
-        side = to_side(reading_dir, cell.direction)
+        enter_side = to_side(reading_dir, cell.direction)
+        if enter_side not in wiring:
+            return 0
 
-        if side in wiring:
-            go_through = go_through_wires(cell.x, cell.y, reading_dir, visited)
+        exits = [s for s in wiring if s != enter_side]
+        if not exits:
+            return 0
 
-            return get_math_value(
-                get_cell_idx_at_pos(go_through['x'], go_through['y']),
-                go_through['direction'],
-                visited
-            )
+        # Leave through the OTHER side of the wire (fixes curves + inputs)
+        exit_dir = (exits[0] + cell.direction) % 4
+        go_through = go_through_wires(cell.x, cell.y, exit_dir, visited)
 
-        return 0
+        return get_math_value(
+            get_cell_idx_at_pos(go_through['x'], go_through['y']),
+            go_through['direction'],
+            visited,
+        )
 
     if cell.name == 'number':
         return cell.properties.get('Value', 0)
 
     if cell.name in subcategories['operations']:
+        # Readable only from the output (front) side
         if cell.direction != (reading_dir + 2) % 4:
             return 0
 
-        top_data = go_through_wires(cell.x, cell.y, cell.direction - 1)
-        bottom_data = go_through_wires(cell.x, cell.y, cell.direction + 1)
+        top_dir = (cell.direction - 1) % 4
+        bot_dir = (cell.direction + 1) % 4
+        top_vec = dir_to_vec2(top_dir)
+        bot_vec = dir_to_vec2(bot_dir)
 
-        top_id = get_cell_idx_at_pos(top_data['x'], top_data['y'])
-        bottom_id = get_cell_idx_at_pos(bottom_data['x'], bottom_data['y'])
+        top_id = get_cell_idx_at_pos(cell.x + top_vec.x, cell.y + top_vec.y)
+        bot_id = get_cell_idx_at_pos(cell.x + bot_vec.x, cell.y + bot_vec.y)
+
+        topval = get_math_value(top_id, top_dir, visited.copy())
+        botval = get_math_value(bot_id, bot_dir, visited.copy())
 
         if cell.name == 'subtract':
-            return (
-                    get_math_value(top_id, cell.direction - 1, visited.copy()) -
-                    get_math_value(bottom_id, cell.direction + 1, visited.copy())
-            )
+            return topval - botval
         if cell.name == 'multiply':
-            return (
-                    get_math_value(top_id, cell.direction - 1, visited.copy()) *
-                    get_math_value(bottom_id, cell.direction + 1, visited.copy())
-            )
-        return (
-                get_math_value(top_id, cell.direction - 1, visited.copy()) +
-                get_math_value(bottom_id, cell.direction + 1, visited.copy())
-        )
+            return topval * botval
+        return topval + botval
 
     return 0
 
@@ -4018,159 +4048,122 @@ def update():
         elif cell.name == 'leap puller':
             pull_cell(i, dir_to_vec2(cell.direction).multiply(2), 1, 999, {'lastcell': i})
 
-    def update_maker(i, cell, direction):
-        gx, gy = cell.x, cell.y
-
-        rotations = get_tag(cell.name, 'gen_rotate')
+    def _normalize_gen_params(cell_name):
+        """Shared gen_rotate / gen_move / gen_output_offset handling."""
+        rotations = get_tag(cell_name, 'gen_rotate')
         if rotations is None:
             rotations = [0]
         elif isinstance(rotations, (int, float)):
             rotations = [rotations]
 
-        move_offset = get_tag(cell.name, 'gen_move') or 0
+        move_offset = get_tag(cell_name, 'gen_move') or 0
 
-        output_offsets = get_tag(cell.name, 'gen_output_offset')
+        output_offsets = get_tag(cell_name, 'gen_output_offset')
         if output_offsets is None:
             output_offsets = [0]
         elif isinstance(output_offsets, (int, float)):
             output_offsets = [output_offsets]
 
+        return rotations, move_offset, output_offsets
+
+    def _resolve_genas(source_name, source_props, source_side, source_obj):
+        """Resolve gen_as tag into (name_or_0, props, blocked)."""
+        genas = get_tag(source_name, 'gen_as', source_obj, source_side)
+        if genas is None:
+            genas = source_name
+        if genas == 'BLOCK_GENERATOR':
+            return None, None, True
+        gen_props = source_props
+        if isinstance(genas, dict):
+            gen_props = genas.get('properties', gen_props)
+            genas = genas.get('name', source_name)
+        return genas, gen_props, False
+
+    def _emit_outputs(gen_cell_id, gen_cell, direction, genas, gen_props, behind_direction,
+                      rotations, move_offset, output_offsets, single_cell=False):
+        """
+        Shared place/push/fork logic for generators and makers.
+        behind_direction: facing of the cell being cloned.
+        """
+        gx, gy = gen_cell.x, gen_cell.y
+        genz = genas == 0
+        physical_type = get_tag(gen_cell.name, 'physical')
+
+        for rot in rotations:
+            for output_offset in output_offsets:
+                out_dir = (direction + move_offset + output_offset + rot) % 4
+                out_vec = dir_to_vec2(out_dir)
+
+                forward = step_forward(gx, gy, out_vec)
+                frontpos = (forward['x'], forward['y'])
+                front_id = get_cell_idx_at_pos(frontpos[0], frontpos[1])
+
+                # Prefer forking into a correctly-oriented forker over pushing it away
+                if (not genz and front_id is not None and front_id in cells
+                        and cells[front_id].name == 'forker'):
+                    gen_dir = behind_direction + move_offset + rot
+                    if try_fork_generated(front_id, genas, gen_dir, gen_props, out_vec):
+                        continue
+
+                if single_cell and front_id is not None:
+                    continue
+
+                placed_dir = behind_direction + move_offset + rot
+
+                if front_id is None or push_cell(front_id, out_vec, 1, 999, {'lastcell': front_id})[0]:
+                    if not genz:
+                        add_cell(genas, frontpos[0], frontpos[1], placed_dir,
+                                 gx, gy, behind_direction, properties=gen_props)
+                elif physical_type == 'physical' and push_cell(
+                        gen_cell_id, dir_to_vec2((direction + 2) % 4), 1, 999,
+                        {'lastcell': gen_cell_id})[0]:
+                    gx, gy = gen_cell.x, gen_cell.y
+                    forward = step_forward(gx, gy, out_vec)
+                    frontpos = (forward['x'], forward['y'])
+                    if not genz:
+                        add_cell(genas, frontpos[0], frontpos[1], placed_dir,
+                                 gx, gy, behind_direction, properties=gen_props)
+
+    def update_maker(i, cell, direction):
         cellbehind = get_stored_data(i)
         if cellbehind is None:
             return
 
-        genas = get_tag(cellbehind['name'], 'gen_as', cellbehind, None)
-
-        if genas is None:
-            genas = cellbehind['name']
-
-        if genas == 'BLOCK_GENERATOR':
+        genas, gen_props, blocked = _resolve_genas(
+            cellbehind['name'], cellbehind['properties'], None, cellbehind
+        )
+        if blocked:
             return
 
-        gen_props = cellbehind['properties']
-
-        if isinstance(genas, dict):
-            gen_props = genas.get('properties', gen_props)
-            genas = genas.get('name', cellbehind['name'])
-
-        genz = genas == 0
-
-        for rot in rotations:
-            for output_offset in output_offsets:
-                out_dir = (direction + move_offset + output_offset + rot) % 4
-
-                forward = step_forward(gx, gy, dir_to_vec2(out_dir))
-                frontpos = (forward['x'], forward['y'])
-                front_id = get_cell_idx_at_pos(frontpos[0], frontpos[1])
-
-                physical_type = get_tag(cell.name, 'physical')
-
-                if front_id is None or push_cell(front_id, dir_to_vec2(out_dir), 1, 999, {'lastcell': front_id})[0]:
-                    if not genz:
-                        add_cell(genas, frontpos[0], frontpos[1], cellbehind['direction'] + move_offset + rot, gx, gy,
-                                 cellbehind['direction'], properties=gen_props)
-
-                elif physical_type == 'physical' and \
-                        push_cell(i, dir_to_vec2((direction + 2) % 4), 1, 999, {'lastcell': i})[0]:
-                    gx, gy = cell.x, cell.y
-
-                    forward = step_forward(gx, gy, dir_to_vec2(out_dir))
-                    frontpos = (forward['x'], forward['y'])
-
-                    if not genz:
-                        add_cell(genas, frontpos[0], frontpos[1], cellbehind['direction'] + move_offset + rot, gx, gy,
-                                 cellbehind['direction'], properties=gen_props)
+        rotations, move_offset, output_offsets = _normalize_gen_params(cell.name)
+        _emit_outputs(
+            i, cell, direction, genas, gen_props, cellbehind['direction'],
+            rotations, move_offset, output_offsets,
+        )
 
     def update_generator(i, cell, direction):
-        gx, gy = cell.x, cell.y
-
-        rotations = get_tag(cell.name, 'gen_rotate')
-        if rotations is None:
-            rotations = [0]
-        elif isinstance(rotations, int) or isinstance(rotations, float):
-            rotations = [rotations]
-
-        move_offset = get_tag(cell.name, 'gen_move') or 0
-
-        output_offsets = get_tag(cell.name, 'gen_output_offset')
-        if output_offsets is None:
-            output_offsets = [0]
-        elif isinstance(output_offsets, int) or isinstance(output_offsets, float):
-            output_offsets = [output_offsets]
-
+        rotations, move_offset, output_offsets = _normalize_gen_params(cell.name)
         input_dir = (direction + move_offset) % 4
 
-        backward = step_forward(gx, gy, dir_to_vec2((input_dir + 2) % 4))
-        behindpos = (backward['x'], backward['y'])
-        behind_id = get_cell_idx_at_pos(behindpos[0], behindpos[1])
-
+        backward = step_forward(cell.x, cell.y, dir_to_vec2((input_dir + 2) % 4))
+        behind_id = get_cell_idx_at_pos(backward['x'], backward['y'])
         if behind_id is None:
             return
 
         behindside = to_side(vec_to_dir(backward['direction']), cells[behind_id].direction)
-
         cellbehind = cells[behind_id].copy()
 
-        genas = get_tag(cellbehind.name, 'gen_as', cellbehind, behindside)
-
-        if genas is None:
-            genas = cellbehind.name
-
-        if genas == 'BLOCK_GENERATOR':
+        genas, gen_props, blocked = _resolve_genas(
+            cellbehind.name, cellbehind.properties, behindside, cellbehind
+        )
+        if blocked:
             return
 
-        gen_props = cellbehind.properties
-
-        if isinstance(genas, dict):
-            gen_props = genas.get('properties', gen_props)
-            genas = genas.get('name', cellbehind.name)
-
-        genz = genas == 0
-
-        for rot in rotations:
-            for output_offset in output_offsets:
-                out_dir = (direction + move_offset + output_offset + rot) % 4
-
-                forward = step_forward(gx, gy, dir_to_vec2(out_dir))
-                frontpos = (forward['x'], forward['y'])
-                front_id = get_cell_idx_at_pos(frontpos[0], frontpos[1])
-                physical_type = get_tag(cell.name, 'physical')
-
-                if cell.name == 'single cell generator' and front_id is not None:
-                    continue
-
-                if front_id is None or (push_cell(front_id, dir_to_vec2(out_dir), 1, 999, {'lastcell': front_id})[0]):
-                    if not genz:
-                        add_cell(
-                            genas,
-                            frontpos[0],
-                            frontpos[1],
-                            cellbehind.direction + move_offset + rot,
-                            gx,
-                            gy,
-                            cellbehind.direction,
-                            properties=gen_props
-                        )
-                elif physical_type == 'physical' and \
-                        push_cell(i, dir_to_vec2((cell.direction + 2) % 4), 1, 999, {'lastcell': i})[0]:
-                    gx, gy = cell.x, cell.y
-                    forward = step_forward(gx, gy, dir_to_vec2(out_dir))
-                    frontpos = (forward['x'], forward['y'])
-                    backward = step_forward(gx, gy, dir_to_vec2((input_dir + 2) % 4))
-                    behindpos = (backward['x'], backward['y'])
-                    behind_id = get_cell_idx_at_pos(behindpos[0], behindpos[1])
-                    cellbehind = cells[behind_id].copy()
-                    if not genz:
-                        add_cell(
-                            genas,
-                            frontpos[0],
-                            frontpos[1],
-                            cellbehind.direction + move_offset + rot,
-                            gx,
-                            gy,
-                            cellbehind.direction,
-                            properties=gen_props
-                        )
+        _emit_outputs(
+            i, cell, direction, genas, gen_props, cellbehind.direction,
+            rotations, move_offset, output_offsets,
+            single_cell=(cell.name == 'single cell generator'),
+        )
 
     def update_mirror(i, cell, direction):
         x, y = cell.x, cell.y
@@ -4390,18 +4383,21 @@ def update():
             cell.properties['force']['bias'] = 0
 
     def update_math(i, cell, direction):
-        front_data = go_through_wires(cell.x, cell.y, cell.direction)
-        top_data = go_through_wires(cell.x, cell.y, cell.direction - 1)
-        bottom_data = go_through_wires(cell.x, cell.y, cell.direction + 1)
-
+        # Output: follow wires in front, write into a Number if present
+        front_data = go_through_wires(cell.x, cell.y, cell.direction % 4)
         frontid = get_cell_idx_at_pos(front_data['x'], front_data['y'])
-        topid = get_cell_idx_at_pos(top_data['x'], top_data['y'])
-        bottomid = get_cell_idx_at_pos(bottom_data['x'], bottom_data['y'])
 
-        front = cells.get(frontid)
+        # Inputs: adjacent cells (wires are resolved inside get_math_value)
+        top_dir = (cell.direction - 1) % 4
+        bot_dir = (cell.direction + 1) % 4
+        top_vec = dir_to_vec2(top_dir)
+        bot_vec = dir_to_vec2(bot_dir)
 
-        topval = get_math_value(topid, cell.direction - 1)
-        botval = get_math_value(bottomid, cell.direction + 1)
+        topid = get_cell_idx_at_pos(cell.x + top_vec.x, cell.y + top_vec.y)
+        bottomid = get_cell_idx_at_pos(cell.x + bot_vec.x, cell.y + bot_vec.y)
+
+        topval = get_math_value(topid, top_dir)
+        botval = get_math_value(bottomid, bot_dir)
 
         if cell.name == 'add':
             answer = topval + botval
@@ -4412,8 +4408,8 @@ def update():
         else:
             return
 
-        if frontid is not None:
-            front.properties['Value'] = answer
+        if frontid is not None and frontid in cells and cells[frontid].name == 'number':
+            cells[frontid].properties['Value'] = answer
 
     run_directional_updates(cell_list, subcategories['operations'], update_math, reverse=True)
     run_directional_updates(cell_list, ['mirror'], update_mirror, 'h')
@@ -4465,6 +4461,60 @@ def same_vec(a, b):
 
 def opposite_vec(a, b):
     return a.x * b.y == a.y * b.x and (a.x * b.x + a.y * b.y) < 0
+
+
+def try_fork_generated(forker_id, gen_name, gen_direction, gen_props, push_direction, force=1):
+    """Try to feed a newly generated cell into a forker instead of pushing the forker.
+    Returns True if the forker successfully forked the generated cell."""
+    global next_id
+
+    if forker_id not in cells:
+        return False
+
+    forker = cells[forker_id]
+    input_dir = vec_to_dir(push_direction) if isinstance(push_direction, Vec2) else push_direction % 4
+
+    if to_side(input_dir, forker.direction) != 2:
+        return False
+
+    next_id += 1
+    entering_id = next_id
+
+    props = copy.deepcopy(gen_props) if gen_props else {}
+    props.setdefault('coins', 0)
+    props.setdefault('euros', 0)
+    props.setdefault('item', None)
+    props['tickamount'] = 1
+
+    entering = cells_module.Cell(
+        x=forker.x,
+        y=forker.y,
+        direction=gen_direction,
+        name=gen_name,
+        oldx=forker.x,
+        oldy=forker.y,
+        olddirection=gen_direction,
+        effects={},
+        properties=props,
+        storing=None,
+    )
+
+    if not register_cell(entering_id, entering, index_position=False):
+        return False
+
+    result = do_forker(forker_id, entering_id, push_direction, force, 999, set())
+
+    if result is None:
+        unregister_cell(entering_id)
+        return False
+
+    success, _ = result
+    if not success:
+        if entering_id in cells:
+            unregister_cell(entering_id)
+        return False
+
+    return True
 
 
 def do_forker(forker_id, entering_id, direction, force, depth, crossed):
@@ -4543,6 +4593,8 @@ def push_cell(cell_id, direction, force, depth, data=None):
         return True, force
 
     lastcellid = data.get('lastcell') or cell_id
+    if cells.get(lastcellid) is None:
+        return True, force
 
     if is_nonexistant(cell.name, 'push', to_side(dir_num, cell.direction), cell_id):
         if lastcellid in cells:
@@ -5604,6 +5656,8 @@ if __name__ == '__main__':
         draw_editor()
         draw_menu()
         draw_desc()
+        ticks_display = pygame.font.Font(resource_path('nokiafcellua.ttf'), 10).render(f'Ticks: {ticks}', True, (255, 255, 255))
+        screen.blit(ticks_display, (10, 0))
         pygame.display.flip()
         dt_ms = clock.tick(60)
         dt = dt_ms / 1000
